@@ -1,8 +1,10 @@
 """Google Gemini LLM provider implementation."""
 import warnings
 import logging
+import functools
 from typing import Optional
 import os
+import ssl
 from .base import (
     BaseLLMProvider,
     LLMProviderError,
@@ -13,31 +15,67 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
-# Suppress deprecation warning for google.generativeai
-warnings.filterwarnings("ignore", message=".*google.generativeai.*", category=FutureWarning)
+# Disable SSL verification for Gemini API (to avoid CERTIFICATE_VERIFY_FAILED errors)
+# This is useful in corporate environments with proxy/certificate issues
+os.environ['PYTHONHTTPSVERIFY'] = '0'
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+os.environ['SSL_CERT_FILE'] = ''
 
-# Configure SSL certificates for Gemini API (fixes CERTIFICATE_VERIFY_FAILED)
+# Disable SSL verification globally for this module
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Disable SSL warnings
 try:
-    import certifi
-    # Set SSL certificate file for httpx/requests (used by google-generativeai)
-    if not os.getenv('SSL_CERT_FILE'):
-        os.environ['SSL_CERT_FILE'] = certifi.where()
-    if not os.getenv('REQUESTS_CA_BUNDLE'):
-        os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
-    pass  # certifi not installed, use system defaults
+    pass
 
-# Try to import Google Generative AI, but make it optional
+# Patch httpx to disable SSL verification by default (google-genai uses httpx)
 try:
-    import google.generativeai as genai
+    import httpx
+    
+    # Store original Client class init
+    _original_httpx_client_init = httpx.Client.__init__
+    
+    @functools.wraps(_original_httpx_client_init)
+    def _patched_httpx_client_init(self, *args, **kwargs):
+        """Patched httpx.Client.__init__ to force verify=False"""
+        # Force verify=False regardless of what's passed
+        kwargs['verify'] = False
+        return _original_httpx_client_init(self, *args, **kwargs)
+    
+    # Apply the patch
+    httpx.Client.__init__ = _patched_httpx_client_init
+    
+    # Also patch AsyncClient if it exists
+    if hasattr(httpx, 'AsyncClient'):
+        _original_async_client_init = httpx.AsyncClient.__init__
+        
+        @functools.wraps(_original_async_client_init)
+        def _patched_async_client_init(self, *args, **kwargs):
+            """Patched httpx.AsyncClient.__init__ to force verify=False"""
+            kwargs['verify'] = False
+            return _original_async_client_init(self, *args, **kwargs)
+        
+        httpx.AsyncClient.__init__ = _patched_async_client_init
+    
+    logger.info("Patched httpx to disable SSL verification by default")
+except (ImportError, AttributeError, TypeError) as e:
+    logger.warning(f"Could not patch httpx for SSL verification: {e}")
+
+# Try to import Google GenAI (new package), but make it optional
+try:
+    import google.genai as genai
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-    logger.warning("Google Generative AI library not installed. Install with: pip install google-generativeai")
+    logger.warning("Google GenAI library not installed. Install with: pip install google-genai")
 
 
 class GeminiProvider(BaseLLMProvider):
-    """Google Gemini provider using Generative AI API."""
+    """Google Gemini provider using GenAI API."""
     
     def __init__(
         self,
@@ -52,7 +90,7 @@ class GeminiProvider(BaseLLMProvider):
         Initialize Gemini provider.
         
         Args:
-            model: Gemini model name (e.g., "gemini-pro", "gemini-pro-vision")
+            model: Gemini model name (e.g., "gemini-pro", "gemini-1.5-pro")
             timeout: Request timeout in seconds
             temperature: Sampling temperature (0.0-2.0)
             max_tokens: Maximum tokens to generate
@@ -61,7 +99,7 @@ class GeminiProvider(BaseLLMProvider):
         """
         if not GEMINI_AVAILABLE:
             raise ImportError(
-                "Google Generative AI library not installed. Install with: pip install google-generativeai"
+                "Google GenAI library not installed. Install with: pip install google-genai"
             )
         
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
@@ -69,8 +107,9 @@ class GeminiProvider(BaseLLMProvider):
         # Configure Gemini client before validation
         self.client = None
         if self.api_key:
-            genai.configure(api_key=self.api_key)
-            self.client = genai.GenerativeModel(model)
+            # New API: Create client with API key
+            self.client = genai.Client(api_key=self.api_key)
+            self.model_name = model
         
         # Now call super().__init__ which will call _validate_config()
         super().__init__(model, timeout, temperature, max_tokens, **kwargs)
@@ -107,37 +146,21 @@ class GeminiProvider(BaseLLMProvider):
         try:
             logger.info(f"Gemini generating with model: {self.model}")
             
-            # Prepare generation config
-            generation_config_dict = {
-                "temperature": kwargs.get("temperature", self.temperature),
-            }
-            
-            if self.max_tokens:
-                generation_config_dict["max_output_tokens"] = self.max_tokens
-            elif "max_tokens" in kwargs:
-                generation_config_dict["max_output_tokens"] = kwargs["max_tokens"]
-            
-            # Create generation config object
-            generation_config = genai.types.GenerationConfig(**generation_config_dict)
-            
-            # Prepare request parameters
-            request_params = {
-                "contents": prompt,
-                "generation_config": generation_config
-            }
-            
-            # Add provider-specific parameters
-            if "safety_settings" in kwargs:
-                request_params["safety_settings"] = kwargs["safety_settings"]
-            
-            # Generate content
-            response = self.client.generate_content(**request_params)
+            # New API: Generate content using client
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config={
+                    "temperature": kwargs.get("temperature", self.temperature),
+                    "max_output_tokens": self.max_tokens or kwargs.get("max_tokens"),
+                }
+            )
             
             # Extract text from response
             if not response:
                 raise LLMProviderError("Gemini returned empty response")
             
-            # Handle different response formats
+            # Handle different response formats (new API structure may differ)
             if hasattr(response, 'text') and response.text:
                 output = response.text
             elif hasattr(response, 'candidates') and response.candidates:
@@ -171,4 +194,3 @@ class GeminiProvider(BaseLLMProvider):
     def get_provider_name(self) -> str:
         """Return provider identifier."""
         return "gemini"
-

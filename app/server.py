@@ -13,6 +13,7 @@ from typing import Optional
 
 from app.endpoints.routes import APIRoutes
 from app.services import APIServices
+from app.db import DatabaseInitializer
 
 # ============================================================
 # Paths & Environment
@@ -106,62 +107,6 @@ def get_duckdb():
 # DuckDB Initialization
 # ============================================================
 
-def init_duckdb():
-    logger.info("Initializing DuckDB tables")
-    """Initialize DuckDB tables."""
-    conn = get_duckdb()
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS partners (
-            id VARCHAR PRIMARY KEY,
-            name VARCHAR,
-            category VARCHAR,
-            contact_email VARCHAR,
-            total_revenue DOUBLE,
-            total_expenses DOUBLE,
-            status VARCHAR,
-            created_at TIMESTAMP
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS invoices (
-            id VARCHAR PRIMARY KEY,
-            partner_id VARCHAR,
-            partner_name VARCHAR,
-            invoice_number VARCHAR,
-            amount DOUBLE,
-            type VARCHAR,
-            status VARCHAR,
-            due_date DATE,
-            paid_date DATE,
-            category VARCHAR,
-            description VARCHAR,
-            created_at TIMESTAMP
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cashflow_entries (
-            id VARCHAR PRIMARY KEY,
-            date DATE,
-            inflow DOUBLE,
-            outflow DOUBLE,
-            net_flow DOUBLE,
-            running_balance DOUBLE,
-            category VARCHAR
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS partner_llm_insights (
-            partner_code VARCHAR PRIMARY KEY,
-            insights_json TEXT,
-            created_at TIMESTAMP DEFAULT now(),
-            updated_at TIMESTAMP DEFAULT now()
-        )
-    """)
-
 
 # ============================================================
 # FastAPI Lifecycle
@@ -171,8 +116,10 @@ def init_duckdb():
 async def startup():
     """Initialize application on startup."""
     global duckdb_conn
-    duckdb_conn = duckdb.connect(str(DUCKDB_PATH))
-    init_duckdb()
+    
+    # Initialize database (migrations + seeding)
+    initializer = DatabaseInitializer(DUCKDB_PATH)
+    duckdb_conn = initializer.initialize()
     logger.info(f"DuckDB initialized at {DUCKDB_PATH}")
     
     # Initialize services and routes
@@ -197,7 +144,7 @@ async def shutdown():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

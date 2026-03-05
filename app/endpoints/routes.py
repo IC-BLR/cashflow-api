@@ -58,6 +58,8 @@ class APIRoutes:
         self.router.post("/pipeline/upload")(self.upload_csv_files)
         self.router.get("/settings")(self.get_settings)
         self.router.put("/settings/cfo_dashboard_enabled")(self.set_cfo_dashboard_flag)
+        self.router.put("/settings/llm_provider")(self.set_llm_provider)
+        self.router.put("/settings/gemini_api_key")(self.set_gemini_api_key)
         self.router.get("/exceptions")(self.get_exceptions)
     
     async def root(self):
@@ -272,7 +274,6 @@ class APIRoutes:
             raise HTTPException(status_code=500, detail={"error": "INTERNAL_ERROR", "message": "An unexpected error occurred"})
     
     async def set_cfo_dashboard_flag(self, value: bool = Query(...)):
-        logger
         """Set CFO dashboard feature flag."""
         try:
             result = self.services.set_feature_flag("cfo_dashboard_enabled", value)
@@ -288,6 +289,42 @@ class APIRoutes:
             )
         except Exception as e:
             logger.error(f"Unexpected error setting feature flag: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail={"error": "INTERNAL_ERROR", "message": "An unexpected error occurred"})
+
+    async def set_llm_provider(self, provider: str = Query(..., description="LLM provider name (e.g., ollama, gemini)")):
+        """Set the active LLM provider used for insights."""
+        try:
+            result = self.services.set_llm_provider(provider)
+            return result
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "VALIDATION_ERROR",
+                    "message": str(e),
+                    "details": {}
+                }
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error setting LLM provider: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail={"error": "INTERNAL_ERROR", "message": "An unexpected error occurred"})
+        
+    async def set_gemini_api_key(self, api_key: str = Query(..., description="Gemini API key")):
+        """Set the Gemini API key and persist it to backend .env."""
+        try:
+            result = self.services.set_gemini_api_key(api_key)
+            return result
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "VALIDATION_ERROR",
+                    "message": str(e),
+                    "details": {}
+                }
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error setting Gemini API key: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail={"error": "INTERNAL_ERROR", "message": "An unexpected error occurred"})
         
     async def invoice_history(self, invoice_number: str):

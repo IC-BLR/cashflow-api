@@ -13,6 +13,7 @@ from collections import defaultdict
 import pandas as pd
 
 from app.services.llm_service import LLMService
+from app.services.llm.factory import LLMProviderFactory
 from app.services.forecast_service import ForecastService
 from app.services.data_pipeline_service import DataPipelineService
 from app.repositories import (
@@ -73,17 +74,43 @@ class APIServices:
         self.invoice_history_repo = invoice_history_repo or InvoiceHistoryRepository(get_duckdb_func)
         self._llm_service = None
         self._forecast_service = None
-        # Feature flags storage (in-memory, defaults to False)
+        # Feature flags / settings storage (in-memory)
         self._feature_flags = {
-            "cfo_dashboard_enabled": False
+            "cfo_dashboard_enabled": False,
+            # Default LLM provider used for partner risk insights.
+            # Can be switched at runtime via the settings API (e.g., "ollama", "gemini").
+            "llm_provider": "ollama",
         }
     
     @property
     def llm_service(self):
         logger.info("Inititalizing LLM service")
-        """Lazy initialization of LLM service."""
+        """
+        Lazy initialization of LLM service.
+
+        The active provider is controlled by the in-memory `llm_provider`
+        setting so it can be switched at runtime (e.g., between ollama and gemini).
+        """
+        desired_provider = self._feature_flags.get("llm_provider")
+
+        # If no service exists yet, create one with the desired provider (or default behaviour)
         if self._llm_service is None:
-            self._llm_service = LLMService()
+            self._llm_service = LLMService(provider_name=desired_provider)
+            return self._llm_service
+
+        # If provider has changed since last initialization, recreate the service
+        try:
+            current_provider = self._llm_service.provider.get_provider_name()
+        except Exception:
+            current_provider = None
+
+        if desired_provider and desired_provider.lower() != (current_provider or "").lower():
+            logger.info(
+                f"LLM provider changed from {current_provider} to {desired_provider}. "
+                f"Reinitializing LLMService."
+            )
+            self._llm_service = LLMService(provider_name=desired_provider)
+
         return self._llm_service
     
     def get_forecast_service(self, conn):
@@ -754,6 +781,82 @@ class APIServices:
         self._feature_flags[flag_key] = value
         logger.info(f"Feature flag {flag_key} set to {value}")
         return {"flag": flag_key, "value": value}
+
+    def set_gemini_api_key(self, api_key: str) -> Dict[str, Any]:
+        """
+        Set or update the Gemini API key.
+
+        This updates the in-memory environment (os.environ) so new Gemini
+        provider instances can use it, and also persists it to the backend
+        `.env` file so it survives restarts.
+        """
+        if not api_key or not api_key.strip():
+            raise ValueError("API key is required")
+
+        api_key = api_key.strip()
+
+        # Update process environment so future provider instances see the key
+        os.environ["GEMINI_API_KEY"] = api_key
+
+        # Best-effort persistence to backend/.env
+        try:
+            from pathlib import Path
+
+            # backend/app/services/services.py -> backend/
+            root_dir = Path(__file__).parent.parent.parent
+            env_path = root_dir / ".env"
+
+            lines = []
+            if env_path.exists():
+                lines = env_path.read_text().splitlines()
+
+            found = False
+            new_lines = []
+            for line in lines:
+                if line.startswith("GEMINI_API_KEY="):
+                    new_lines.append(f"GEMINI_API_KEY={api_key}")
+                    found = True
+                else:
+                    new_lines.append(line)
+
+            if not found:
+                new_lines.append(f"GEMINI_API_KEY={api_key}")
+
+            env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            logger.info(f"Updated GEMINI_API_KEY in {env_path}")
+        except Exception as e:
+            # Log but do not fail the request – in-memory env var is still updated
+            logger.error(f"Failed to persist GEMINI_API_KEY to .env: {str(e)}", exc_info=True)
+
+        # Force reinit so new key is picked up by Gemini provider
+        self._llm_service = None
+
+        return {"provider": "gemini", "api_key_set": True}
+
+    def set_llm_provider(self, provider_name: str) -> Dict[str, Any]:
+        """
+        Set the active LLM provider (e.g., 'ollama', 'gemini').
+
+        This controls which backend LLM implementation is used for insights.
+        """
+        if not provider_name:
+            raise ValueError("Provider name is required")
+
+        provider_name = provider_name.lower()
+        available = LLMProviderFactory.get_available_providers()
+        if provider_name not in available:
+            raise ValueError(
+                f"Unknown LLM provider: {provider_name}. "
+                f"Available providers: {', '.join(available)}"
+            )
+
+        logger.info(f"Setting LLM provider to {provider_name}")
+        self._feature_flags["llm_provider"] = provider_name
+
+        # Force reinitialization on next access so new provider is used
+        self._llm_service = None
+
+        return {"provider": provider_name}
     
     def get_exceptions(self, severity: Optional[str] = None, exception_type: Optional[str] = None, age_bucket: Optional[str] = None) -> Dict[str, Any]:
         logger.info(f"Retrieving exceptions with filters: severity={severity}, exception_type={exception_type}, age_bucket={age_bucket}")
