@@ -3,9 +3,11 @@ API Routes - All endpoint handlers.
 """
 import io
 import logging
-from typing import List, Optional
-from fastapi import APIRouter, Query, HTTPException, UploadFile, File
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Query, HTTPException, UploadFile, File, Body
 from fastapi.responses import StreamingResponse, Response, JSONResponse
+from pydantic import BaseModel
+from app.services.chatbot_service import ChatbotService
 
 from app.models import (
     AggregateSummaryResponse,
@@ -28,6 +30,12 @@ from app.core.exceptions import (
 logger = logging.getLogger(__name__)
 
 
+class ChatbotQueryRequest(BaseModel):
+    """Request model for chatbot query endpoint."""
+    query: str
+    conversationHistory: Optional[List[Dict[str, str]]] = None
+
+
 class APIRoutes:
     """Class containing all API route handlers."""
     
@@ -41,6 +49,7 @@ class APIRoutes:
         """
         self.router = api_router
         self.services = services
+        self.chatbot_service = ChatbotService(self.services)
         self._register_routes()
     
     def _register_routes(self):
@@ -61,6 +70,7 @@ class APIRoutes:
         self.router.put("/settings/llm_provider")(self.set_llm_provider)
         self.router.put("/settings/gemini_api_key")(self.set_gemini_api_key)
         self.router.get("/exceptions")(self.get_exceptions)
+        self.router.post("/chatbot/query")(self.chatbot_query)
     
     async def root(self):
         logger.debug("Root endpoint accessed")
@@ -337,9 +347,40 @@ class APIRoutes:
             logger.error(f"Error getting history: {str(e)}")
             raise HTTPException(status_code=500, detail="Internal Server Error")
 
-
-
-
-
-
-    
+    async def chatbot_query(self, request: ChatbotQueryRequest = Body(...)):
+        logger.info(f"Processing chatbot query: {request.query[:100]}")
+        
+        try:
+            query = request.query.strip()
+            conversation_history = request.conversationHistory or []
+            
+            if not query:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "VALIDATION_ERROR",
+                        "message": "Query cannot be empty",
+                        "details": {}
+                    }
+                )
+            
+            # Process query through chatbot service
+            result = self.chatbot_service.process_query(
+                query=query,
+                conversation_history=conversation_history
+            )
+            
+            return JSONResponse(content=result)
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in chatbot query: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "INTERNAL_ERROR",
+                    "message": "An unexpected error occurred processing your query",
+                    "details": {"error": str(e)}
+                }
+            )

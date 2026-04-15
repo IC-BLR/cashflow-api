@@ -327,7 +327,7 @@ class ForecastService:
                 days_to_payment = (predicted_date - today).days
                 
                 # Only include if within forecast period
-                if 0 <= days_to_payment <= days:
+                if 0 <= days_to_payment < days:
                     forecast_events.append({
                         "partner_code": p_code,
                         "partner_name": p_name,
